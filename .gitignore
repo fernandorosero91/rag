@@ -1,0 +1,45 @@
+# Entorno virtual
+venv/
+env/
+ENV/
+
+# Base de datos vectorial
+db/
+
+# Logs
+logs/
+*.log
+
+# PDFs (pueden contener información sensible)
+pdfs/*.pdf
+
+# Variables de entorno (contiene API keys)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Modelos descargados
+*.bin
+*.gguf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Sistema
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Temporales
+*.tmp
+*.bak
+test_*.py
+buscar_*.py

@@ -1,0 +1,8 @@
+faster-whisper
+chromadb
+sentence-transformers
+pymupdf
+sounddevice
+numpy
+requests
+python-dotenv
