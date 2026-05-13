@@ -29,12 +29,12 @@ except ImportError as e:
     sys.exit(1)
 
 # ── Configuración ─────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY_1 = os.getenv("GROQ_API_KEY_1", "")
+GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2", "")
+GROQ_API_KEY_3 = os.getenv("GROQ_API_KEY_3", "")
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama3.3-70b")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", 8))  # Aumentado para más contexto
 DB_PATH = "./db"
 EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -81,8 +81,31 @@ def buscar_en_documentos(pregunta: str):
     return fragmentos
 
 # ── Función para llamar LLM ───────────────────────────────────
+def _llamar_groq(api_key, pregunta, sistema):
+    """Llama a Groq con una key específica."""
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        json={
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": sistema},
+                {"role": "user", "content": pregunta}
+            ],
+            "max_tokens": 1000,
+            "temperature": 0.2
+        },
+        timeout=10
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 def obtener_respuesta(pregunta: str, contexto: str):
-    """Llama a Groq para obtener respuesta."""
+    """Llama a los proveedores en cascada: Groq1 → Groq2 → Groq3 → Cerebras."""
     
     sistema = f"""Eres un asistente experto que responde preguntas usando SOLO la información del contexto dado.
 
@@ -97,18 +120,24 @@ REGLAS:
 CONTEXTO DE LOS DOCUMENTOS:
 {contexto}"""
     
-    # Intentar Groq primero
-    if GROQ_API_KEY and GROQ_API_KEY != "tu_groq_api_key_aqui":
-        try:
-            print("💬 Consultando Groq...")
+    # Construir lista de proveedores disponibles
+    proveedores = []
+    if GROQ_API_KEY_1 and "tu_groq_api_key" not in GROQ_API_KEY_1:
+        proveedores.append(("Groq-1", lambda: _llamar_groq(GROQ_API_KEY_1, pregunta, sistema)))
+    if GROQ_API_KEY_2 and "tu_groq_api_key" not in GROQ_API_KEY_2:
+        proveedores.append(("Groq-2", lambda: _llamar_groq(GROQ_API_KEY_2, pregunta, sistema)))
+    if GROQ_API_KEY_3 and "tu_groq_api_key" not in GROQ_API_KEY_3:
+        proveedores.append(("Groq-3", lambda: _llamar_groq(GROQ_API_KEY_3, pregunta, sistema)))
+    if CEREBRAS_API_KEY and CEREBRAS_API_KEY != "tu_cerebras_api_key_aqui":
+        def _llamar_cerebras():
             resp = requests.post(
-                "https://api.groq.com/openai/v1/chat/completions",
+                "https://api.cerebras.ai/v1/chat/completions",
                 headers={
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
+                    "Authorization": f"Bearer {CEREBRAS_API_KEY}",
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": GROQ_MODEL,
+                    "model": CEREBRAS_MODEL,
                     "messages": [
                         {"role": "system", "content": sistema},
                         {"role": "user", "content": pregunta}
@@ -116,52 +145,19 @@ CONTEXTO DE LOS DOCUMENTOS:
                     "max_tokens": 1000,
                     "temperature": 0.2
                 },
-                timeout=10
+                timeout=12
             )
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip(), "Groq"
-        except Exception as e:
-            print(f"⚠️  Groq falló: {e}")
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        proveedores.append(("Cerebras", _llamar_cerebras))
     
-    # Fallback a OpenRouter
-    if OPENROUTER_API_KEY and OPENROUTER_API_KEY != "tu_openrouter_api_key_aqui":
+    for nombre, fn in proveedores:
         try:
-            print("💬 Consultando OpenRouter...")
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": OPENROUTER_MODEL,
-                    "messages": [
-                        {"role": "system", "content": sistema},
-                        {"role": "user", "content": pregunta}
-                    ],
-                    "max_tokens": 1000
-                },
-                timeout=15
-            )
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip(), "OpenRouter"
+            print(f"💬 Consultando {nombre}...")
+            respuesta = fn()
+            return respuesta, nombre
         except Exception as e:
-            print(f"⚠️  OpenRouter falló: {e}")
-    
-    # Fallback a Gemini
-    if GEMINI_API_KEY and GEMINI_API_KEY != "tu_gemini_api_key_aqui":
-        try:
-            print("💬 Consultando Gemini...")
-            mensaje = f"{sistema}\n\nPregunta: {pregunta}"
-            resp = requests.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
-                json={"contents": [{"parts": [{"text": mensaje}]}]},
-                timeout=15
-            )
-            if resp.status_code == 200:
-                return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip(), "Gemini"
-        except Exception as e:
-            print(f"⚠️  Gemini falló: {e}")
+            print(f"⚠️  {nombre} falló: {e}")
     
     return "❌ No se pudo obtener respuesta de ninguna API", "Error"
 

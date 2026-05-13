@@ -32,8 +32,12 @@ except ImportError as e:
     sys.exit(1)
 
 # ── Configuración ─────────────────────────────────────────────
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_API_KEY_1 = os.getenv("GROQ_API_KEY_1", "")
+GROQ_API_KEY_2 = os.getenv("GROQ_API_KEY_2", "")
+GROQ_API_KEY_3 = os.getenv("GROQ_API_KEY_3", "")
+CEREBRAS_API_KEY = os.getenv("CEREBRAS_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama3.3-70b")
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL", "base")
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "es")
 RAG_TOP_K = 8
@@ -92,28 +96,64 @@ REGLAS:
 CONTEXTO:
 {contexto}"""
     
-    try:
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "model": GROQ_MODEL,
-                "messages": [
-                    {"role": "system", "content": sistema},
-                    {"role": "user", "content": pregunta}
-                ],
-                "max_tokens": 1000,
-                "temperature": 0.2
-            },
-            timeout=10
-        )
-        if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        return f"Error: {e}"
+    # Construir lista de proveedores
+    proveedores = []
+    if GROQ_API_KEY_1 and "tu_groq_api_key" not in GROQ_API_KEY_1:
+        proveedores.append(("Groq-1", GROQ_API_KEY_1))
+    if GROQ_API_KEY_2 and "tu_groq_api_key" not in GROQ_API_KEY_2:
+        proveedores.append(("Groq-2", GROQ_API_KEY_2))
+    if GROQ_API_KEY_3 and "tu_groq_api_key" not in GROQ_API_KEY_3:
+        proveedores.append(("Groq-3", GROQ_API_KEY_3))
+    
+    # Intentar Groq en cascada
+    for nombre, key in proveedores:
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": GROQ_MODEL,
+                    "messages": [
+                        {"role": "system", "content": sistema},
+                        {"role": "user", "content": pregunta}
+                    ],
+                    "max_tokens": 1000,
+                    "temperature": 0.2
+                },
+                timeout=10
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"⚠️ {nombre} falló: {e}")
+    
+    # Fallback a Cerebras
+    if CEREBRAS_API_KEY and CEREBRAS_API_KEY != "tu_cerebras_api_key_aqui":
+        try:
+            resp = requests.post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": CEREBRAS_MODEL,
+                    "messages": [
+                        {"role": "system", "content": sistema},
+                        {"role": "user", "content": pregunta}
+                    ],
+                    "max_tokens": 1000,
+                    "temperature": 0.2
+                },
+                timeout=12
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"⚠️ Cerebras falló: {e}")
     
     return "No se pudo obtener respuesta"
 
