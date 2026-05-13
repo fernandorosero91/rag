@@ -65,12 +65,12 @@ if DEPENDENCIAS_FALTANTES:
     sys.exit(1)
 
 # ── Configuración ─────────────────────────────────────────────
-GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
-GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY_1      = os.getenv("GROQ_API_KEY_1", "")
+GROQ_API_KEY_2      = os.getenv("GROQ_API_KEY_2", "")
+GROQ_API_KEY_3      = os.getenv("GROQ_API_KEY_3", "")
+CEREBRAS_API_KEY    = os.getenv("CEREBRAS_API_KEY", "")
 GROQ_MODEL          = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", "openrouter/free")
-GEMINI_MODEL        = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
+CEREBRAS_MODEL      = os.getenv("CEREBRAS_MODEL", "llama3.3-70b")
 WHISPER_LANGUAGE    = os.getenv("WHISPER_LANGUAGE", "es")
 WHISPER_MODEL_SIZE  = os.getenv("WHISPER_MODEL", "base")
 RAG_TOP_K           = int(os.getenv("RAG_TOP_K", 12))  # Más contexto para capturar información completa
@@ -159,18 +159,16 @@ class MotorRAG:
 
 
 # ════════════════════════════════════════════════════════════
-#  ORQUESTADOR DE LLMs (Groq → OpenRouter → Gemini)
+#  ORQUESTADOR DE LLMs (Groq1 → Groq2 → Groq3 → Cerebras)
 # ════════════════════════════════════════════════════════════
 class OrquestadorLLM:
     
-    def llamar_groq(self, prompt: str, contexto: str) -> str:
-        if not GROQ_API_KEY or GROQ_API_KEY == "tu_groq_api_key_aqui":
-            raise ValueError("Groq API key no configurada")
-        
+    def _llamar_groq(self, api_key: str, prompt: str, contexto: str) -> str:
+        """Llama a la API de Groq con una key específica."""
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
             },
             json={
@@ -179,7 +177,7 @@ class OrquestadorLLM:
                     {"role": "system", "content": self._sistema(contexto)},
                     {"role": "user",   "content": prompt}
                 ],
-                "max_tokens": 1500,  # Respuestas más largas y detalladas
+                "max_tokens": 1500,
                 "temperature": 0.3
             },
             timeout=10
@@ -187,42 +185,30 @@ class OrquestadorLLM:
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
     
-    def llamar_openrouter(self, prompt: str, contexto: str) -> str:
-        if not OPENROUTER_API_KEY or OPENROUTER_API_KEY == "tu_openrouter_api_key_aqui":
-            raise ValueError("OpenRouter API key no configurada")
+    def _llamar_cerebras(self, prompt: str, contexto: str) -> str:
+        """Llama a la API de Cerebras (compatible con formato OpenAI)."""
+        if not CEREBRAS_API_KEY or CEREBRAS_API_KEY == "tu_cerebras_api_key_aqui":
+            raise ValueError("Cerebras API key no configurada")
         
         resp = requests.post(
-            "https://openrouter.ai/api/v1/chat/completions",
+            "https://api.cerebras.ai/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json",
-                "HTTP-Referer": "rag-asistente-local"
+                "Authorization": f"Bearer {CEREBRAS_API_KEY}",
+                "Content-Type": "application/json"
             },
             json={
-                "model": OPENROUTER_MODEL,
+                "model": CEREBRAS_MODEL,
                 "messages": [
                     {"role": "system", "content": self._sistema(contexto)},
                     {"role": "user",   "content": prompt}
                 ],
-                "max_tokens": 1500  # Respuestas más largas y detalladas
+                "max_tokens": 1500,
+                "temperature": 0.3
             },
-            timeout=15
+            timeout=12
         )
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"].strip()
-    
-    def llamar_gemini(self, prompt: str, contexto: str) -> str:
-        if not GEMINI_API_KEY or GEMINI_API_KEY == "tu_gemini_api_key_aqui":
-            raise ValueError("Gemini API key no configurada")
-        
-        mensaje = f"{self._sistema(contexto)}\n\nPregunta: {prompt}"
-        resp = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}",
-            json={"contents": [{"parts": [{"text": mensaje}]}]},
-            timeout=15
-        )
-        resp.raise_for_status()
-        return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
     
     def _sistema(self, contexto: str) -> str:
         return f"""Eres un asistente experto que proporciona respuestas completas y detalladas en español.
@@ -245,13 +231,26 @@ CONTEXTO DE LOS DOCUMENTOS:
 {contexto}"""
     
     def responder(self, pregunta: str, contexto: str) -> tuple[str, str]:
-        """Intenta en orden: Groq → OpenRouter → Gemini. Retorna (respuesta, proveedor)"""
+        """Intenta en orden: Groq1 → Groq2 → Groq3 → Cerebras. Retorna (respuesta, proveedor)"""
         
-        proveedores = [
-            ("Groq ⚡",       self.llamar_groq),
-            ("OpenRouter 🔄", self.llamar_openrouter),
-            ("Gemini 🌟",     self.llamar_gemini),
-        ]
+        proveedores = []
+        
+        # Agregar cuentas Groq configuradas
+        if GROQ_API_KEY_1 and GROQ_API_KEY_1 != "tu_groq_api_key_cuenta1_aqui":
+            proveedores.append(("Groq-1 ⚡", lambda p, c: self._llamar_groq(GROQ_API_KEY_1, p, c)))
+        
+        if GROQ_API_KEY_2 and GROQ_API_KEY_2 != "tu_groq_api_key_cuenta2_aqui":
+            proveedores.append(("Groq-2 ⚡", lambda p, c: self._llamar_groq(GROQ_API_KEY_2, p, c)))
+        
+        if GROQ_API_KEY_3 and GROQ_API_KEY_3 != "tu_groq_api_key_cuenta3_aqui":
+            proveedores.append(("Groq-3 ⚡", lambda p, c: self._llamar_groq(GROQ_API_KEY_3, p, c)))
+        
+        # Cerebras como fallback final
+        if CEREBRAS_API_KEY and CEREBRAS_API_KEY != "tu_cerebras_api_key_aqui":
+            proveedores.append(("Cerebras 🧠", lambda p, c: self._llamar_cerebras(p, c)))
+        
+        if not proveedores:
+            return "❌ No hay APIs configuradas. Edita el archivo .env con tus API keys.", "Error"
         
         ultimo_error = ""
         for nombre, fn in proveedores:
