@@ -50,24 +50,38 @@ EMBED_MODEL = "BAAI/bge-m3"
 #  CHUNKING INTELIGENTE POR ORACIONES
 # ════════════════════════════════════════════════════════════
 def dividir_en_oraciones(texto: str) -> list[str]:
-    """Divide texto en oraciones respetando abreviaturas comunes."""
-    # Patrón: punto/signo seguido de espacio y mayúscula o fin de línea
-    oraciones = re.split(r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ])', texto)
-    # También dividir por saltos de línea dobles (párrafos)
+    """Divide texto en oraciones respetando abreviaturas y viñetas."""
+    # Primero dividir por viñetas/bullets (cada viñeta es una unidad)
+    # Patrones comunes de viñetas en PDFs
+    texto = re.sub(r'\n\s*[●○•▪▸►]\s*', '\n●​ ', texto)  # normalizar viñetas
+    
+    # Dividir por párrafos dobles
+    bloques = re.split(r'\n\s*\n', texto)
+    
     resultado = []
-    for oracion in oraciones:
-        partes = oracion.split('\n\n')
-        for parte in partes:
-            limpia = parte.strip()
-            if limpia:
-                resultado.append(limpia)
+    for bloque in bloques:
+        bloque = bloque.strip()
+        if not bloque:
+            continue
+        
+        # Si el bloque contiene viñetas, mantenerlo como unidad
+        if '●' in bloque or '•' in bloque or '▪' in bloque:
+            resultado.append(bloque)
+        else:
+            # Dividir por oraciones normales
+            oraciones = re.split(r'(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ])', bloque)
+            for oracion in oraciones:
+                limpia = oracion.strip()
+                if limpia:
+                    resultado.append(limpia)
+    
     return resultado
 
 
-def chunking_por_oraciones(texto: str, max_chars: int = 512, overlap_oraciones: int = 1) -> list[str]:
+def chunking_por_oraciones(texto: str, max_chars: int = 700, overlap_oraciones: int = 1) -> list[str]:
     """
-    Divide texto en chunks respetando límites de oraciones.
-    Nunca corta a mitad de frase.
+    Divide texto en chunks respetando límites de oraciones y viñetas.
+    Si un bloque con viñetas excede max_chars, se incluye completo (no se corta).
     """
     oraciones = dividir_en_oraciones(texto)
     
@@ -79,21 +93,23 @@ def chunking_por_oraciones(texto: str, max_chars: int = 512, overlap_oraciones: 
     
     while i < len(oraciones):
         chunk_actual = ""
-        oraciones_en_chunk = 0
         inicio_chunk = i
         
         while i < len(oraciones):
-            candidato = chunk_actual + (" " if chunk_actual else "") + oraciones[i]
+            candidato = chunk_actual + ("\n\n" if chunk_actual else "") + oraciones[i]
             
+            # Si agregar esta oración excede el límite Y ya tenemos contenido
             if len(candidato) > max_chars and chunk_actual:
-                # El chunk ya está lleno, no agregar más
+                # Pero si la oración actual tiene viñetas, incluirla completa
+                if '●' in oraciones[i] and len(chunk_actual) < max_chars * 0.3:
+                    chunk_actual = candidato
+                    i += 1
                 break
             
             chunk_actual = candidato
-            oraciones_en_chunk += 1
             i += 1
             
-            # Si una sola oración excede max_chars, la incluimos completa
+            # Si una sola oración/bloque excede max_chars, la incluimos completa
             if len(chunk_actual) > max_chars:
                 break
         
