@@ -84,11 +84,11 @@ EMBED_MODEL         = "BAAI/bge-m3"
 
 # Audio config — optimizado para velocidad
 SAMPLE_RATE     = 16000
-BLOCK_SECONDS   = 0.5
-SILENCE_UMBRAL  = 0.015
-MIN_SPEECH_SEC  = 1.5
-MAX_BUFFER_SEC  = 10          # Reducido para respuesta más rápida
-SILENCE_BLOCKS  = 4           # 2 segundos de silencio (antes era 3s)
+BLOCK_SECONDS   = 0.3           # Bloques más cortos para reacción rápida
+SILENCE_UMBRAL  = 0.012         # Ligeramente más sensible
+MIN_SPEECH_SEC  = 1.2           # Mínimo más corto para procesar
+MAX_BUFFER_SEC  = 10
+SILENCE_BLOCKS  = 4             # 4 × 0.3s = 1.2s de silencio para cortar
 
 # Palabras clave para detectar preguntas — solo las más confiables
 PALABRAS_PREGUNTA_INICIO = [
@@ -96,7 +96,8 @@ PALABRAS_PREGUNTA_INICIO = [
     "cuándo", "cuando", "dónde", "donde", "por qué", "quién", "quien",
     "cuánto", "cuanto", "cuántos", "cuántas",
     "explica", "explique", "describe", "menciona", "define",
-    "dime", "dame", "muéstrame", "cuéntame", "enumera", "lista"
+    "dime", "dame", "muéstrame", "cuéntame", "enumera", "lista",
+    "háblame", "hablame", "habla", "háblanos", "hablanos"
 ]
 
 # ── Cola de comunicación entre hilos ─────────────────────────
