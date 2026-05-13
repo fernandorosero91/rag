@@ -60,7 +60,7 @@ except:
 
 try:
     import chromadb
-    from sentence_transformers import SentenceTransformer, CrossEncoder
+    from sentence_transformers import SentenceTransformer
 except:
     DEPENDENCIAS_FALTANTES.append("chromadb sentence-transformers")
 
@@ -88,7 +88,6 @@ RAG_TOP_K           = int(os.getenv("RAG_TOP_K", 10))     # Chunks finales al LL
 DB_PATH             = "./db"
 BM25_PATH           = "./db/bm25_index.json"
 EMBED_MODEL         = "BAAI/bge-m3"
-RERANKER_MODEL      = "Alibaba-NLP/gte-multilingual-reranker-base"
 
 # Audio config — optimizado para velocidad
 SAMPLE_RATE     = 16000
@@ -214,7 +213,6 @@ class BuscadorBM25:
 class MotorRAG:
     def __init__(self):
         self.modelo_embed = None
-        self.reranker     = None
         self.coleccion    = None
         self.bm25         = None
         self.listo        = False
@@ -223,9 +221,6 @@ class MotorRAG:
         try:
             cola_ui.put(("estado", "🧠 Cargando embeddings BGE-M3..."))
             self.modelo_embed = SentenceTransformer(EMBED_MODEL)
-            
-            cola_ui.put(("estado", "🎯 Cargando reranker..."))
-            self.reranker = CrossEncoder(RERANKER_MODEL, trust_remote_code=True)
             
             cola_ui.put(("estado", "🗄️ Cargando base de datos..."))
             cliente = chromadb.PersistentClient(path=DB_PATH)
@@ -238,7 +233,7 @@ class MotorRAG:
             count = self.coleccion.count()
             self.listo = True
             
-            modo = "Híbrida (Vector+BM25+Reranker)" if bm25_ok else "Vector+Reranker"
+            modo = "Híbrida (Vector + BM25 + RRF)" if bm25_ok else "Vector"
             cola_ui.put(("estado", f"✅ RAG listo — {count} fragmentos | {modo}"))
             cola_ui.put(("log", f"Base de datos: {count} fragmentos | Modo: {modo}"))
             return True
@@ -247,7 +242,7 @@ class MotorRAG:
             return False
     
     def buscar(self, consulta: str) -> list[dict]:
-        """Búsqueda híbrida: Vector + BM25 → RRF Fusion → Reranker → Top-K."""
+        """Búsqueda híbrida: Vector + BM25 → RRF Fusion → Top-K."""
         if not self.listo:
             return []
         
@@ -273,35 +268,11 @@ class MotorRAG:
             if not candidatos:
                 return []
             
-            # 4. Reranker — re-puntuar los top candidatos
-            textos_candidatos = [c["texto"] for c in candidatos[:18]]
-            pares = [(consulta, texto) for texto in textos_candidatos]
-            
-            try:
-                scores_rerank = self.reranker.predict(pares, convert_to_numpy=True)
-                # Asegurar que es un array plano
-                import numpy as np_scores
-                scores_array = np_scores.array(scores_rerank).flatten()
-            except Exception as e_rerank:
-                cola_ui.put(("log", f"⚠️ Reranker falló: {e_rerank}, usando scores RRF"))
-                # Fallback: usar scores de RRF sin reranker
-                resultado_final = candidatos[:RAG_TOP_K]
-                elapsed = time.time() - t0
-                cola_ui.put(("log", f"RAG: {len(resultado_final)} chunks en {elapsed:.2f}s (vec+bm25, sin rerank)"))
-                return resultado_final
-            
-            # Combinar con scores de reranker
-            for i in range(min(len(scores_array), len(candidatos))):
-                candidatos[i]["relevancia"] = float(scores_array[i])
-            
-            # Ordenar por score del reranker
-            candidatos_reranked = sorted(candidatos[:18], key=lambda x: x.get("relevancia", -999), reverse=True)
-            
-            # Filtrar y tomar top-K (sin umbral — el reranker ya ordenó por relevancia)
-            resultado_final = candidatos_reranked[:RAG_TOP_K]
+            # Tomar top-K directamente del RRF
+            resultado_final = candidatos[:RAG_TOP_K]
             
             elapsed = time.time() - t0
-            cola_ui.put(("log", f"RAG: {len(resultado_final)} chunks en {elapsed:.2f}s (vec+bm25+rerank)"))
+            cola_ui.put(("log", f"RAG: {len(resultado_final)} chunks en {elapsed:.2f}s (vec+bm25+rrf)"))
             
             return resultado_final
             
@@ -428,12 +399,14 @@ class OrquestadorLLM:
     def _sistema(self, contexto: str) -> str:
         return f"""Eres un asistente experto. Responde en español usando SOLO el contexto dado.
 
-REGLAS:
-- Usa TODA la información relevante del contexto
-- Combina información de diferentes fragmentos si es necesario
-- Si hay listas, enumera TODOS los elementos
-- Sé conciso pero completo
-- NO inventes información fuera del contexto
+REGLAS OBLIGATORIAS:
+- Enumera TODOS los elementos, puntos o conceptos que aparezcan en el contexto
+- Si hay una lista con 3 items, menciona los 3. Si hay 5, menciona los 5. NUNCA omitas elementos.
+- Incluye las descripciones o explicaciones de cada elemento
+- Combina información de diferentes fragmentos del contexto
+- NO digas "no se menciona" si la información está en algún fragmento
+- NO resumas ni acortes listas — preséntalas COMPLETAS
+- Español profesional
 
 CONTEXTO:
 {contexto}"""
