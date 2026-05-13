@@ -37,8 +37,8 @@ except ImportError as e:
 
 # ── Configuración ─────────────────────────────────────────────
 PDF_FOLDER    = os.getenv("PDF_FOLDER", "./pdfs")
-CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", 512))      # Reducido para mayor precisión
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 64))    # Overlap por oraciones
+CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE", 700))      # Más grande para capturar listas completas
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 80))    # Overlap por oraciones
 DB_PATH       = "./db"
 BM25_PATH     = "./db/bm25_index.json"
 

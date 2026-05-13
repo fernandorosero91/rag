@@ -84,11 +84,11 @@ GROQ_MODEL          = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 CEREBRAS_MODEL      = os.getenv("CEREBRAS_MODEL", "llama3.3-70b")
 WHISPER_LANGUAGE    = os.getenv("WHISPER_LANGUAGE", "es")
 WHISPER_MODEL_SIZE  = os.getenv("WHISPER_MODEL", "tiny")  # tiny para velocidad
-RAG_TOP_K           = int(os.getenv("RAG_TOP_K", 5))      # Menos chunks pero mejores (reranker)
+RAG_TOP_K           = int(os.getenv("RAG_TOP_K", 10))     # Chunks finales al LLM (post-reranker)
 DB_PATH             = "./db"
 BM25_PATH           = "./db/bm25_index.json"
 EMBED_MODEL         = "BAAI/bge-m3"
-RERANKER_MODEL      = "BAAI/bge-reranker-v2-m3"
+RERANKER_MODEL      = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 # Audio config — optimizado para velocidad
 SAMPLE_RATE     = 16000
@@ -254,18 +254,18 @@ class MotorRAG:
         try:
             t0 = time.time()
             
-            # 1. Búsqueda vectorial (top-20)
+            # 1. Búsqueda vectorial (top-25)
             embedding = self.modelo_embed.encode([consulta], normalize_embeddings=True).tolist()
             resultados_vec = self.coleccion.query(
                 query_embeddings=embedding,
-                n_results=20,
+                n_results=25,
                 include=["documents", "metadatas", "distances"]
             )
             
-            # 2. Búsqueda BM25 (top-20)
+            # 2. Búsqueda BM25 (top-25)
             resultados_bm25 = []
             if self.bm25 and self.bm25.listo:
-                resultados_bm25 = self.bm25.buscar(consulta, top_k=20)
+                resultados_bm25 = self.bm25.buscar(consulta, top_k=25)
             
             # 3. RRF Fusion (combinar rankings)
             candidatos = self._rrf_fusion(resultados_vec, resultados_bm25)
@@ -274,7 +274,7 @@ class MotorRAG:
                 return []
             
             # 4. Reranker — re-puntuar los top candidatos
-            textos_candidatos = [c["texto"] for c in candidatos[:15]]
+            textos_candidatos = [c["texto"] for c in candidatos[:18]]
             pares = [(consulta, texto) for texto in textos_candidatos]
             
             scores_rerank = self.reranker.predict(pares)
@@ -284,13 +284,10 @@ class MotorRAG:
                 candidatos[i]["relevancia"] = float(score)
             
             # Ordenar por score del reranker
-            candidatos_reranked = sorted(candidatos[:15], key=lambda x: x["relevancia"], reverse=True)
+            candidatos_reranked = sorted(candidatos[:18], key=lambda x: x["relevancia"], reverse=True)
             
-            # Filtrar por umbral y tomar top-K
-            resultado_final = []
-            for c in candidatos_reranked[:RAG_TOP_K]:
-                if c["relevancia"] > -2.0:  # Cross-encoder puede dar negativos, umbral permisivo
-                    resultado_final.append(c)
+            # Filtrar y tomar top-K (sin umbral — el reranker ya ordenó por relevancia)
+            resultado_final = candidatos_reranked[:RAG_TOP_K]
             
             elapsed = time.time() - t0
             cola_ui.put(("log", f"RAG: {len(resultado_final)} chunks en {elapsed:.2f}s (vec+bm25+rerank)"))
@@ -350,7 +347,7 @@ class OrquestadorLLM:
                     {"role": "system", "content": self._sistema(contexto)},
                     {"role": "user",   "content": prompt}
                 ],
-                "max_tokens": 800,
+                "max_tokens": 1200,
                 "temperature": 0.2,
                 "stream": True
             },
@@ -392,7 +389,7 @@ class OrquestadorLLM:
                     {"role": "system", "content": self._sistema(contexto)},
                     {"role": "user",   "content": prompt}
                 ],
-                "max_tokens": 800,
+                "max_tokens": 1200,
                 "temperature": 0.2,
                 "stream": True
             },
