@@ -1,9 +1,18 @@
 """
 ================================================================
-RAG ASISTENTE - ESCUCHA REUNIONES Y RESPONDE CON TUS DOCUMENTOS
+RAG ASISTENTE v2.0 - ESCUCHA REUNIONES Y RESPONDE CON TUS DOCUMENTOS
 ================================================================
 Arquitectura:
-  Teams Audio → VB-Cable → faster-whisper → ChromaDB RAG → Groq/OpenRouter/Gemini → UI Flotante
+  Teams Audio → VB-Cable → faster-whisper → Búsqueda Híbrida (Vector + BM25)
+  → Reranker → Top-5 chunks → LLM Streaming → UI Flotante
+
+Mejoras v2.0:
+  - Búsqueda híbrida (semántica + keywords BM25)
+  - Reranker cross-encoder para precisión
+  - Streaming de respuestas (se ve en tiempo real)
+  - Whisper tiny para velocidad
+  - Timeouts cortos con detección de rate-limit
+  - Detección de preguntas más precisa
 
 Uso: python asistente.py
 ================================================================
@@ -16,9 +25,11 @@ import queue
 import threading
 import re
 import json
+import math
 import traceback
 from datetime import datetime
 from pathlib import Path
+from collections import Counter
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -49,7 +60,7 @@ except:
 
 try:
     import chromadb
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer, CrossEncoder
 except:
     DEPENDENCIAS_FALTANTES.append("chromadb sentence-transformers")
 
@@ -72,28 +83,28 @@ CEREBRAS_API_KEY    = os.getenv("CEREBRAS_API_KEY", "")
 GROQ_MODEL          = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 CEREBRAS_MODEL      = os.getenv("CEREBRAS_MODEL", "llama3.3-70b")
 WHISPER_LANGUAGE    = os.getenv("WHISPER_LANGUAGE", "es")
-WHISPER_MODEL_SIZE  = os.getenv("WHISPER_MODEL", "base")
-RAG_TOP_K           = int(os.getenv("RAG_TOP_K", 12))  # Más contexto para capturar información completa
+WHISPER_MODEL_SIZE  = os.getenv("WHISPER_MODEL", "tiny")  # tiny para velocidad
+RAG_TOP_K           = int(os.getenv("RAG_TOP_K", 5))      # Menos chunks pero mejores (reranker)
 DB_PATH             = "./db"
-EMBED_MODEL         = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+BM25_PATH           = "./db/bm25_index.json"
+EMBED_MODEL         = "BAAI/bge-m3"
+RERANKER_MODEL      = "BAAI/bge-reranker-v2-m3"
 
-# Audio config
+# Audio config — optimizado para velocidad
 SAMPLE_RATE     = 16000
 BLOCK_SECONDS   = 0.5
-SILENCE_UMBRAL  = 0.015       # sensibilidad al silencio
-MIN_SPEECH_SEC  = 1.5         # mínimo para procesar
-MAX_BUFFER_SEC  = 12          # máximo antes de procesar
+SILENCE_UMBRAL  = 0.015
+MIN_SPEECH_SEC  = 1.5
+MAX_BUFFER_SEC  = 10          # Reducido para respuesta más rápida
+SILENCE_BLOCKS  = 4           # 2 segundos de silencio (antes era 3s)
 
-# Palabras clave para detectar preguntas (además de signos)
-PALABRAS_PREGUNTA = [
+# Palabras clave para detectar preguntas — solo las más confiables
+PALABRAS_PREGUNTA_INICIO = [
     "qué", "que", "cómo", "como", "cuál", "cual", "cuáles", "cuales",
-    "cuándo", "cuando", "dónde", "donde", "por qué", "porque", "quién",
-    "quien", "cuánto", "cuanto", "explica", "explique", "describe",
-    "menciona", "define", "definir", "nombra", "indica", "di",
-    "habla", "comenta", "analiza", "compara", "relaciona",
-    "puede", "podría", "alguien", "sabe", "conoce",
-    "dime", "dame", "muestra", "muéstrame", "diga", "cuéntame",
-    "enumera", "lista", "detalla", "especifica", "señala"
+    "cuándo", "cuando", "dónde", "donde", "por qué", "quién", "quien",
+    "cuánto", "cuanto", "cuántos", "cuántas",
+    "explica", "explique", "describe", "menciona", "define",
+    "dime", "dame", "muéstrame", "cuéntame", "enumera", "lista"
 ]
 
 # ── Cola de comunicación entre hilos ─────────────────────────
@@ -101,70 +112,232 @@ cola_ui = queue.Queue()
 
 
 # ════════════════════════════════════════════════════════════
-#  MOTOR RAG
+#  BM25 LOCAL (búsqueda por keywords)
+# ════════════════════════════════════════════════════════════
+class BuscadorBM25:
+    """Búsqueda BM25 local usando índice pre-calculado."""
+    
+    def __init__(self):
+        self.listo = False
+        self.textos = []
+        self.metadatas = []
+        self.docs_tokens = []
+        self.df = {}
+        self.N = 0
+        self.avgdl = 0
+        self.doc_lengths = []
+    
+    def cargar(self) -> bool:
+        try:
+            if not os.path.exists(BM25_PATH):
+                return False
+            
+            with open(BM25_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            
+            indice = data["indice"]
+            self.textos = data["textos"]
+            self.metadatas = data["metadatas"]
+            self.docs_tokens = indice["docs_tokens"]
+            self.df = indice["df"]
+            self.N = indice["N"]
+            self.avgdl = indice["avgdl"]
+            self.doc_lengths = indice["doc_lengths"]
+            self.listo = True
+            return True
+        except Exception as e:
+            print(f"⚠️ BM25 no disponible: {e}")
+            return False
+    
+    def _tokenizar(self, texto: str) -> list[str]:
+        texto = texto.lower()
+        texto = re.sub(r'[^\w\sáéíóúñü]', ' ', texto)
+        tokens = texto.split()
+        stopwords = {'de', 'la', 'el', 'en', 'y', 'a', 'los', 'las', 'del', 'un', 'una',
+                     'que', 'es', 'se', 'por', 'con', 'para', 'al', 'lo', 'como', 'su',
+                     'más', 'o', 'este', 'ya', 'entre', 'muy', 'sin', 'sobre',
+                     'ser', 'también', 'me', 'hasta', 'hay', 'donde', 'le', 'todo', 'nos'}
+        return [t for t in tokens if t not in stopwords and len(t) > 2]
+    
+    def buscar(self, consulta: str, top_k: int = 20) -> list[dict]:
+        """Busca usando BM25. Retorna top_k resultados con score."""
+        if not self.listo:
+            return []
+        
+        query_tokens = self._tokenizar(consulta)
+        if not query_tokens:
+            return []
+        
+        k1 = 1.5
+        b = 0.75
+        scores = []
+        
+        for doc_idx in range(self.N):
+            score = 0.0
+            dl = self.doc_lengths[doc_idx]
+            doc_tokens = self.docs_tokens[doc_idx]
+            tf_counter = Counter(doc_tokens)
+            
+            for qt in query_tokens:
+                if qt not in self.df:
+                    continue
+                
+                tf = tf_counter.get(qt, 0)
+                if tf == 0:
+                    continue
+                
+                df_val = self.df[qt]
+                idf = math.log((self.N - df_val + 0.5) / (df_val + 0.5) + 1)
+                tf_norm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * dl / self.avgdl))
+                score += idf * tf_norm
+            
+            if score > 0:
+                scores.append((doc_idx, score))
+        
+        # Ordenar por score descendente
+        scores.sort(key=lambda x: x[1], reverse=True)
+        
+        resultados = []
+        for doc_idx, score in scores[:top_k]:
+            resultados.append({
+                "texto": self.textos[doc_idx],
+                "fuente": self.metadatas[doc_idx].get("fuente", "?"),
+                "score_bm25": score
+            })
+        
+        return resultados
+
+
+# ════════════════════════════════════════════════════════════
+#  MOTOR RAG v2.0 (Híbrido + Reranker)
 # ════════════════════════════════════════════════════════════
 class MotorRAG:
     def __init__(self):
         self.modelo_embed = None
+        self.reranker     = None
         self.coleccion    = None
+        self.bm25         = None
         self.listo        = False
     
     def cargar(self):
         try:
-            cola_ui.put(("estado", "🧠 Cargando embeddings..."))
+            cola_ui.put(("estado", "🧠 Cargando embeddings BGE-M3..."))
             self.modelo_embed = SentenceTransformer(EMBED_MODEL)
+            
+            cola_ui.put(("estado", "🎯 Cargando reranker..."))
+            self.reranker = CrossEncoder(RERANKER_MODEL)
             
             cola_ui.put(("estado", "🗄️ Cargando base de datos..."))
             cliente = chromadb.PersistentClient(path=DB_PATH)
             self.coleccion = cliente.get_collection("documentos_rag")
             
+            cola_ui.put(("estado", "🔤 Cargando índice BM25..."))
+            self.bm25 = BuscadorBM25()
+            bm25_ok = self.bm25.cargar()
+            
             count = self.coleccion.count()
             self.listo = True
-            cola_ui.put(("estado", f"✅ RAG listo — {count} fragmentos indexados"))
-            cola_ui.put(("log", f"Base de datos cargada: {count} fragmentos"))
+            
+            modo = "Híbrida (Vector+BM25+Reranker)" if bm25_ok else "Vector+Reranker"
+            cola_ui.put(("estado", f"✅ RAG listo — {count} fragmentos | {modo}"))
+            cola_ui.put(("log", f"Base de datos: {count} fragmentos | Modo: {modo}"))
             return True
         except Exception as e:
-            cola_ui.put(("error", f"❌ Base de datos no encontrada.\nEjecuta primero: python indexar_pdfs.py\n\nError: {e}"))
+            cola_ui.put(("error", f"❌ Error cargando RAG.\nEjecuta primero: python indexar_pdfs.py\n\nError: {e}"))
             return False
     
     def buscar(self, consulta: str) -> list[dict]:
+        """Búsqueda híbrida: Vector + BM25 → RRF Fusion → Reranker → Top-K."""
         if not self.listo:
             return []
+        
         try:
-            embedding = self.modelo_embed.encode([consulta]).tolist()
-            resultados = self.coleccion.query(
+            t0 = time.time()
+            
+            # 1. Búsqueda vectorial (top-20)
+            embedding = self.modelo_embed.encode([consulta], normalize_embeddings=True).tolist()
+            resultados_vec = self.coleccion.query(
                 query_embeddings=embedding,
-                n_results=RAG_TOP_K,
+                n_results=20,
                 include=["documents", "metadatas", "distances"]
             )
             
-            fragmentos = []
-            for doc, meta, dist in zip(
-                resultados["documents"][0],
-                resultados["metadatas"][0],
-                resultados["distances"][0]
-            ):
-                relevancia = 1 - dist  # cosine → similaridad
-                if relevancia > 0.20:  # Umbral más bajo para capturar más contexto
-                    fragmentos.append({
-                        "texto": doc,
-                        "fuente": meta.get("fuente", "?"),
-                        "relevancia": relevancia
-                    })
+            # 2. Búsqueda BM25 (top-20)
+            resultados_bm25 = []
+            if self.bm25 and self.bm25.listo:
+                resultados_bm25 = self.bm25.buscar(consulta, top_k=20)
             
-            return fragmentos
+            # 3. RRF Fusion (combinar rankings)
+            candidatos = self._rrf_fusion(resultados_vec, resultados_bm25)
+            
+            if not candidatos:
+                return []
+            
+            # 4. Reranker — re-puntuar los top candidatos
+            textos_candidatos = [c["texto"] for c in candidatos[:15]]
+            pares = [(consulta, texto) for texto in textos_candidatos]
+            
+            scores_rerank = self.reranker.predict(pares)
+            
+            # Combinar con scores de reranker
+            for i, score in enumerate(scores_rerank):
+                candidatos[i]["relevancia"] = float(score)
+            
+            # Ordenar por score del reranker
+            candidatos_reranked = sorted(candidatos[:15], key=lambda x: x["relevancia"], reverse=True)
+            
+            # Filtrar por umbral y tomar top-K
+            resultado_final = []
+            for c in candidatos_reranked[:RAG_TOP_K]:
+                if c["relevancia"] > -2.0:  # Cross-encoder puede dar negativos, umbral permisivo
+                    resultado_final.append(c)
+            
+            elapsed = time.time() - t0
+            cola_ui.put(("log", f"RAG: {len(resultado_final)} chunks en {elapsed:.2f}s (vec+bm25+rerank)"))
+            
+            return resultado_final
+            
         except Exception as e:
             cola_ui.put(("log", f"Error RAG: {e}"))
             return []
+    
+    def _rrf_fusion(self, resultados_vec, resultados_bm25, k=60) -> list[dict]:
+        """Reciprocal Rank Fusion para combinar vector + BM25."""
+        fusion_scores = {}  # texto → {score, metadata}
+        
+        # Vectorial
+        if resultados_vec and resultados_vec["documents"][0]:
+            for rank, (doc, meta, dist) in enumerate(zip(
+                resultados_vec["documents"][0],
+                resultados_vec["metadatas"][0],
+                resultados_vec["distances"][0]
+            )):
+                key = doc[:100]  # usar primeros 100 chars como key
+                rrf_score = 1.0 / (k + rank + 1)
+                if key not in fusion_scores:
+                    fusion_scores[key] = {"texto": doc, "fuente": meta.get("fuente", "?"), "score": 0}
+                fusion_scores[key]["score"] += rrf_score
+        
+        # BM25
+        for rank, resultado in enumerate(resultados_bm25):
+            key = resultado["texto"][:100]
+            rrf_score = 1.0 / (k + rank + 1)
+            if key not in fusion_scores:
+                fusion_scores[key] = {"texto": resultado["texto"], "fuente": resultado["fuente"], "score": 0}
+            fusion_scores[key]["score"] += rrf_score
+        
+        # Ordenar por RRF score
+        candidatos = sorted(fusion_scores.values(), key=lambda x: x["score"], reverse=True)
+        return candidatos
 
 
 # ════════════════════════════════════════════════════════════
-#  ORQUESTADOR DE LLMs (Groq1 → Groq2 → Groq3 → Cerebras)
+#  ORQUESTADOR DE LLMs CON STREAMING
 # ════════════════════════════════════════════════════════════
 class OrquestadorLLM:
     
-    def _llamar_groq(self, api_key: str, prompt: str, contexto: str) -> str:
-        """Llama a la API de Groq con una key específica."""
+    def _llamar_groq_stream(self, api_key: str, prompt: str, contexto: str):
+        """Llama a Groq con streaming. Yield tokens parciales."""
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={
@@ -177,16 +350,33 @@ class OrquestadorLLM:
                     {"role": "system", "content": self._sistema(contexto)},
                     {"role": "user",   "content": prompt}
                 ],
-                "max_tokens": 1500,
-                "temperature": 0.3
+                "max_tokens": 800,
+                "temperature": 0.2,
+                "stream": True
             },
-            timeout=10
+            timeout=8,
+            stream=True
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        
+        for line in resp.iter_lines():
+            if line:
+                line_str = line.decode("utf-8")
+                if line_str.startswith("data: "):
+                    data = line_str[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            yield content
+                    except:
+                        continue
     
-    def _llamar_cerebras(self, prompt: str, contexto: str) -> str:
-        """Llama a la API de Cerebras (compatible con formato OpenAI)."""
+    def _llamar_cerebras_stream(self, prompt: str, contexto: str):
+        """Llama a Cerebras con streaming."""
         if not CEREBRAS_API_KEY or CEREBRAS_API_KEY == "tu_cerebras_api_key_aqui":
             raise ValueError("Cerebras API key no configurada")
         
@@ -202,71 +392,90 @@ class OrquestadorLLM:
                     {"role": "system", "content": self._sistema(contexto)},
                     {"role": "user",   "content": prompt}
                 ],
-                "max_tokens": 1500,
-                "temperature": 0.3
+                "max_tokens": 800,
+                "temperature": 0.2,
+                "stream": True
             },
-            timeout=12
+            timeout=10,
+            stream=True
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        
+        for line in resp.iter_lines():
+            if line:
+                line_str = line.decode("utf-8")
+                if line_str.startswith("data: "):
+                    data = line_str[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        content = delta.get("content", "")
+                        if content:
+                            yield content
+                    except:
+                        continue
     
     def _sistema(self, contexto: str) -> str:
-        return f"""Eres un asistente experto que proporciona respuestas completas y detalladas en español.
+        return f"""Eres un asistente experto. Responde en español usando SOLO el contexto dado.
 
-REGLAS CRÍTICAS:
-- Proporciona respuestas COMPLETAS usando TODA la información disponible en el contexto
-- Si el contexto contiene información fragmentada, UNELA y preséntala de forma coherente
-- Si hay listas o múltiples elementos en CUALQUIER parte del contexto, enumera TODOS con sus descripciones completas
-- Usa formato claro con numeración, viñetas o párrafos según sea apropiado
-- NO digas "no está disponible" si la información existe en alguna parte del contexto
-- Si encuentras información parcial en diferentes fragmentos, COMBÍNALA en una respuesta completa
-- Explica conceptos de forma clara y profesional
-- Usa solo la información del contexto proporcionado, pero úsala TODA
-- Español neutro y profesional
+REGLAS:
+- Usa TODA la información relevante del contexto
+- Combina información de diferentes fragmentos si es necesario
+- Si hay listas, enumera TODOS los elementos
+- Sé conciso pero completo
+- NO inventes información fuera del contexto
 
-IMPORTANTE: Si ves títulos como "Objetivo general", "Objetivos específicos", "Principios", etc., 
-busca el contenido correspondiente en TODO el contexto y preséntalo completo.
-
-CONTEXTO DE LOS DOCUMENTOS:
+CONTEXTO:
 {contexto}"""
     
-    def responder(self, pregunta: str, contexto: str) -> tuple[str, str]:
-        """Intenta en orden: Groq1 → Groq2 → Groq3 → Cerebras. Retorna (respuesta, proveedor)"""
-        
+    def responder_stream(self, pregunta: str, contexto: str):
+        """
+        Intenta en cascada con streaming.
+        Yield: tuplas (tipo, dato) donde tipo es "token" o "done".
+        """
         proveedores = []
         
-        # Agregar cuentas Groq configuradas
-        if GROQ_API_KEY_1 and GROQ_API_KEY_1 != "tu_groq_api_key_cuenta1_aqui":
-            proveedores.append(("Groq-1 ⚡", lambda p, c: self._llamar_groq(GROQ_API_KEY_1, p, c)))
-        
-        if GROQ_API_KEY_2 and GROQ_API_KEY_2 != "tu_groq_api_key_cuenta2_aqui":
-            proveedores.append(("Groq-2 ⚡", lambda p, c: self._llamar_groq(GROQ_API_KEY_2, p, c)))
-        
-        if GROQ_API_KEY_3 and GROQ_API_KEY_3 != "tu_groq_api_key_cuenta3_aqui":
-            proveedores.append(("Groq-3 ⚡", lambda p, c: self._llamar_groq(GROQ_API_KEY_3, p, c)))
-        
-        # Cerebras como fallback final
+        if GROQ_API_KEY_1 and "tu_groq_api_key" not in GROQ_API_KEY_1:
+            proveedores.append(("Groq-1 ⚡", lambda p, c: self._llamar_groq_stream(GROQ_API_KEY_1, p, c)))
+        if GROQ_API_KEY_2 and "tu_groq_api_key" not in GROQ_API_KEY_2:
+            proveedores.append(("Groq-2 ⚡", lambda p, c: self._llamar_groq_stream(GROQ_API_KEY_2, p, c)))
+        if GROQ_API_KEY_3 and "tu_groq_api_key" not in GROQ_API_KEY_3:
+            proveedores.append(("Groq-3 ⚡", lambda p, c: self._llamar_groq_stream(GROQ_API_KEY_3, p, c)))
         if CEREBRAS_API_KEY and CEREBRAS_API_KEY != "tu_cerebras_api_key_aqui":
-            proveedores.append(("Cerebras 🧠", lambda p, c: self._llamar_cerebras(p, c)))
+            proveedores.append(("Cerebras 🧠", lambda p, c: self._llamar_cerebras_stream(p, c)))
         
         if not proveedores:
-            return "❌ No hay APIs configuradas. Edita el archivo .env con tus API keys.", "Error"
+            yield ("error", "❌ No hay APIs configuradas.")
+            return
         
-        ultimo_error = ""
         for nombre, fn in proveedores:
             try:
-                cola_ui.put(("log", f"Consultando {nombre}..."))
+                cola_ui.put(("log", f"Consultando {nombre} (streaming)..."))
                 t0 = time.time()
-                respuesta = fn(pregunta, contexto)
-                elapsed = time.time() - t0
-                cola_ui.put(("log", f"✅ {nombre} respondió en {elapsed:.1f}s"))
-                return respuesta, nombre
+                tokens_recibidos = False
+                
+                for token in fn(pregunta, contexto):
+                    if not tokens_recibidos:
+                        tokens_recibidos = True
+                        ttft = time.time() - t0
+                        cola_ui.put(("log", f"⚡ {nombre} primer token en {ttft:.2f}s"))
+                    yield ("token", token)
+                
+                if tokens_recibidos:
+                    elapsed = time.time() - t0
+                    yield ("done", (nombre, elapsed))
+                    return
+                else:
+                    raise ValueError("No se recibieron tokens")
+                    
             except Exception as e:
-                ultimo_error = str(e)
-                cola_ui.put(("log", f"⚠️ {nombre} falló: {e}"))
+                error_str = str(e)
+                cola_ui.put(("log", f"⚠️ {nombre} falló: {error_str[:80]}"))
                 continue
         
-        return f"❌ Todos los proveedores fallaron. Último error: {ultimo_error}", "Error"
+        yield ("error", "❌ Todos los proveedores fallaron.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -279,8 +488,6 @@ class ProcesadorAudio:
         self.buffer   = np.array([], dtype=np.float32)
         self.modelo_whisper = None
         self.activo   = False
-        self.dispositivo = None
-        self.ultimo_proceso = time.time()
         self.hablando = False
         self.silencio_contador = 0
     
@@ -290,9 +497,9 @@ class ProcesadorAudio:
             self.modelo_whisper = WhisperModel(
                 WHISPER_MODEL_SIZE,
                 device="cpu",
-                compute_type="int8"  # Optimizado para CPU
+                compute_type="int8"
             )
-            cola_ui.put(("estado", f"✅ Whisper cargado"))
+            cola_ui.put(("estado", f"✅ Whisper cargado ({WHISPER_MODEL_SIZE})"))
             cola_ui.put(("log", f"Whisper ({WHISPER_MODEL_SIZE}) listo en CPU/int8"))
             return True
         except Exception as e:
@@ -300,42 +507,42 @@ class ProcesadorAudio:
             return False
     
     def detectar_pregunta(self, texto: str) -> bool:
-        """Detecta si el texto contiene una pregunta."""
+        """Detecta preguntas con menos falsos positivos."""
         texto_lower = texto.lower().strip()
         
-        # Signos de pregunta
+        # Signos de pregunta explícitos
         if "?" in texto:
             return True
         
-        # Palabras clave al inicio (más común)
         palabras = texto_lower.split()
-        if palabras and palabras[0] in PALABRAS_PREGUNTA:
+        if not palabras:
+            return False
+        
+        # Primera palabra es interrogativa
+        if palabras[0] in PALABRAS_PREGUNTA_INICIO:
             return True
         
-        # Cualquier palabra clave en las primeras 3 palabras
+        # Primeras 2 palabras contienen interrogativa
         if len(palabras) >= 2:
-            primeras_palabras = " ".join(palabras[:3])
-            for palabra in PALABRAS_PREGUNTA:
-                if palabra in primeras_palabras:
+            dos_primeras = " ".join(palabras[:2])
+            for p in PALABRAS_PREGUNTA_INICIO[:18]:  # solo interrogativas puras
+                if p in dos_primeras:
                     return True
         
-        # Cualquier palabra clave en el texto (si tiene más de 4 palabras)
-        if len(palabras) > 4:
-            for palabra in PALABRAS_PREGUNTA[:25]:  # las más importantes
-                if palabra in texto_lower:
-                    return True
+        # Frases que empiezan con "por qué" o "para qué"
+        if texto_lower.startswith("por qu") or texto_lower.startswith("para qu"):
+            return True
         
         return False
     
     def transcribir_y_procesar(self, audio_data: np.ndarray):
         """Transcribe audio y procesa si es una pregunta."""
         try:
-            # Transcribir
             segmentos, info = self.modelo_whisper.transcribe(
                 audio_data,
                 language=WHISPER_LANGUAGE,
                 vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 500}
+                vad_parameters={"min_silence_duration_ms": 400}
             )
             
             texto = " ".join([s.text for s in segmentos]).strip()
@@ -344,9 +551,8 @@ class ProcesadorAudio:
                 return
             
             cola_ui.put(("transcripcion", texto))
-            cola_ui.put(("log", f"Transcrito: {texto[:80]}..."))
+            cola_ui.put(("log", f"📝 {texto[:80]}..."))
             
-            # ¿Es una pregunta?
             if self.detectar_pregunta(texto):
                 cola_ui.put(("pregunta_detectada", texto))
                 self.procesar_pregunta(texto)
@@ -355,11 +561,11 @@ class ProcesadorAudio:
             cola_ui.put(("log", f"Error transcripción: {e}"))
     
     def procesar_pregunta(self, pregunta: str):
-        """Busca en RAG y llama al LLM."""
+        """Busca en RAG y llama al LLM con streaming."""
         t_inicio = time.time()
         cola_ui.put(("estado", "🔍 Buscando en documentos..."))
         
-        # Buscar en RAG
+        # Buscar en RAG (híbrido + reranker)
         fragmentos = self.rag.buscar(pregunta)
         
         if not fragmentos:
@@ -367,36 +573,42 @@ class ProcesadorAudio:
             cola_ui.put(("estado", "🎙️ Escuchando..."))
             return
         
-        # Construir contexto
+        # Construir contexto (solo top chunks ya rerankeados)
         contexto_partes = []
         for i, f in enumerate(fragmentos, 1):
-            contexto_partes.append(
-                f"[Fuente: {f['fuente']} | Relevancia: {f['relevancia']:.0%}]\n{f['texto']}"
-            )
+            contexto_partes.append(f"[{f['fuente']}]\n{f['texto']}")
         contexto = "\n\n---\n\n".join(contexto_partes)
         
-        cola_ui.put(("log", f"RAG: {len(fragmentos)} fragmentos relevantes"))
-        cola_ui.put(("estado", "💬 Consultando IA..."))
+        fuentes = list(set(f["fuente"] for f in fragmentos))
+        cola_ui.put(("fuentes", fuentes))
+        cola_ui.put(("estado", "💬 Generando respuesta..."))
         
-        # Llamar LLM
-        respuesta, proveedor = self.llm.responder(pregunta, contexto)
+        # LLM con streaming
+        respuesta_completa = ""
+        proveedor = "?"
+        
+        for tipo, dato in self.llm.responder_stream(pregunta, contexto):
+            if tipo == "token":
+                respuesta_completa += dato
+                cola_ui.put(("stream_token", respuesta_completa))
+            elif tipo == "done":
+                proveedor, elapsed_llm = dato
+            elif tipo == "error":
+                respuesta_completa = dato
+                proveedor = "Error"
         
         elapsed = time.time() - t_inicio
-        fuentes = list(set(f["fuente"] for f in fragmentos))
-        
-        cola_ui.put(("respuesta", (respuesta, proveedor, pregunta, elapsed)))
-        cola_ui.put(("fuentes", fuentes))
+        cola_ui.put(("respuesta", (respuesta_completa, proveedor, pregunta, elapsed)))
         cola_ui.put(("estado", f"✅ Respuesta en {elapsed:.1f}s — Escuchando..."))
     
     def callback_audio(self, indata, frames, time_info, status):
         """Callback del stream de audio."""
         if status:
-            pass  # ignorar warnings menores
+            pass
         
         audio_chunk = indata[:, 0].copy()
         nivel = np.abs(audio_chunk).mean()
         
-        # Detectar si hay voz
         if nivel > SILENCE_UMBRAL:
             self.buffer = np.append(self.buffer, audio_chunk)
             self.hablando = True
@@ -409,8 +621,8 @@ class ProcesadorAudio:
                 
                 segundos_buffer = len(self.buffer) / SAMPLE_RATE
                 
-                # Procesar si hay suficiente silencio o buffer muy grande
-                if (self.silencio_contador > 6 and segundos_buffer > MIN_SPEECH_SEC) or \
+                # Procesar con menos silencio (2s en vez de 3s)
+                if (self.silencio_contador > SILENCE_BLOCKS and segundos_buffer > MIN_SPEECH_SEC) or \
                    segundos_buffer > MAX_BUFFER_SEC:
                     
                     audio_a_procesar = self.buffer.copy()
@@ -418,7 +630,6 @@ class ProcesadorAudio:
                     self.hablando = False
                     self.silencio_contador = 0
                     
-                    # Procesar en hilo separado para no bloquear audio
                     threading.Thread(
                         target=self.transcribir_y_procesar,
                         args=(audio_a_procesar,),
@@ -444,8 +655,9 @@ class ProcesadorAudio:
             cola_ui.put(("log", f"Stream de audio iniciado (dispositivo: {device_index})"))
             return stream
         except Exception as e:
-            cola_ui.put(("error", f"Error iniciando audio: {e}\n\nVerifica que VB-Cable esté instalado y seleccionado."))
+            cola_ui.put(("error", f"Error iniciando audio: {e}\n\nVerifica que VB-Cable esté instalado."))
             return None
+
 
 
 # ════════════════════════════════════════════════════════════
@@ -454,11 +666,9 @@ class ProcesadorAudio:
 class InterfazFlotante:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("RAG Asistente")
-        self.root.attributes("-topmost", True)  # Siempre encima
-        # self.root.attributes("-alpha", 0.95)  # Transparencia desactivada
+        self.root.title("RAG Asistente v2.0")
+        self.root.attributes("-topmost", True)
         self.root.configure(bg="#0a0e1a")
-        # Ventana más grande para 2 pantallas
         self.root.geometry("900x1000+50+20")
         self.root.minsize(800, 900)
         
@@ -490,7 +700,7 @@ class InterfazFlotante:
         header = tk.Frame(self.root, bg=BG, pady=8)
         header.pack(fill="x", padx=12, pady=(10,0))
         
-        tk.Label(header, text="⚡ RAG ASISTENTE", font=("Consolas", 14, "bold"),
+        tk.Label(header, text="⚡ RAG ASISTENTE v2.0", font=("Consolas", 14, "bold"),
                  bg=BG, fg=VERDE).pack(side="left")
         
         self.lbl_proveedor = tk.Label(header, text="iniciando...",
@@ -507,7 +717,7 @@ class InterfazFlotante:
         frame_dev = tk.Frame(self.root, bg=BG2, padx=8, pady=6)
         frame_dev.pack(fill="x", padx=12, pady=6)
         
-        tk.Label(frame_dev, text="🎙️ Entrada de audio:", font=("Consolas", 9),
+        tk.Label(frame_dev, text="🎙️ Entrada:", font=("Consolas", 9),
                  bg=BG2, fg=GRIS).pack(side="left")
         
         self.var_dispositivo = tk.StringVar()
@@ -548,7 +758,7 @@ class InterfazFlotante:
                      anchor="w", padx=14, pady=(8,2))
         
         self.txt_transcripcion = tk.Text(
-            self.root, height=4, font=("Consolas", 10),
+            self.root, height=3, font=("Consolas", 10),
             bg=BG3, fg=TEXTO, relief="flat", padx=8, pady=6,
             wrap="word", state="disabled", insertbackground=TEXTO
         )
@@ -569,7 +779,7 @@ class InterfazFlotante:
         self.lbl_pregunta.pack(fill="x", pady=(4,0))
         
         # ── Respuesta ─────────────────────────────────────────
-        tk.Label(self.root, text="💡 RESPUESTA SUGERIDA",
+        tk.Label(self.root, text="💡 RESPUESTA (streaming)",
                  font=("Consolas", 8, "bold"), bg=BG, fg=VERDE).pack(
                      anchor="w", padx=14, pady=(10,2))
         
@@ -590,7 +800,7 @@ class InterfazFlotante:
         
         # ── Log ───────────────────────────────────────────────
         self.txt_log = tk.Text(
-            self.root, height=6, font=("Consolas", 8),
+            self.root, height=5, font=("Consolas", 8),
             bg=BG3, fg=GRIS, relief="flat", padx=8, pady=4,
             wrap="word", state="disabled"
         )
@@ -601,7 +811,7 @@ class InterfazFlotante:
         self.root.bind("<Escape>", lambda e: self.root.iconify())
         
         # Tip
-        tk.Label(self.root, text="💡 Doble clic en respuesta para copiar | ESC para minimizar",
+        tk.Label(self.root, text="💡 Doble clic en respuesta para copiar | ESC minimizar",
                  font=("Consolas", 7), bg=BG, fg=GRIS).pack(pady=(0,6))
     
     def _set_texto(self, widget: tk.Text, texto: str, color=None):
@@ -650,7 +860,6 @@ class InterfazFlotante:
             nombres = [f"{i}: {n}" for i, n in entradas]
             self.combo_dispositivos["values"] = nombres
             
-            # Seleccionar VB-Cable automáticamente si existe
             for nombre in nombres:
                 if "cable" in nombre.lower() or "vb-audio" in nombre.lower() or "virtual" in nombre.lower():
                     self.combo_dispositivos.set(nombre)
@@ -730,13 +939,17 @@ class InterfazFlotante:
                 elif tipo == "pregunta_detectada":
                     self.pregunta_actual = datos
                     self.lbl_pregunta.config(text=datos, fg="#fbbf24")
-                    self._set_texto(self.txt_respuesta, "⏳ Buscando respuesta...", "#64748b")
+                    self._set_texto(self.txt_respuesta, "⏳ Buscando...", "#64748b")
+                
+                elif tipo == "stream_token":
+                    # Actualizar respuesta en tiempo real (streaming)
+                    self._set_texto(self.txt_respuesta, datos, "#00ff88")
                 
                 elif tipo == "respuesta":
                     respuesta, proveedor, pregunta, elapsed = datos
                     self._set_texto(self.txt_respuesta, respuesta, "#00ff88")
                     self.lbl_proveedor.config(text=f"{proveedor} | {elapsed:.1f}s")
-                    self._log(f"Respuesta via {proveedor} en {elapsed:.1f}s")
+                    self._log(f"✅ {proveedor} en {elapsed:.1f}s")
                 
                 elif tipo == "fuentes":
                     fuentes = datos
@@ -750,8 +963,7 @@ class InterfazFlotante:
         except Exception as e:
             pass
         
-        # Re-programar para el siguiente tick
-        self.root.after(80, self.procesar_cola)
+        self.root.after(50, self.procesar_cola)  # 50ms para streaming más fluido
     
     def ejecutar(self):
         self.root.after(100, self.procesar_cola)
@@ -763,7 +975,9 @@ class InterfazFlotante:
 # ════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("="*60)
-    print("  ⚡ RAG ASISTENTE - Iniciando...")
+    print("  ⚡ RAG ASISTENTE v2.0 - Iniciando...")
+    print("  Búsqueda: Híbrida (Vector + BM25 + Reranker)")
+    print("  Streaming: Activado")
     print("="*60)
     print()
     
