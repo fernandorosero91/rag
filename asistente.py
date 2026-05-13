@@ -4,15 +4,7 @@ RAG ASISTENTE v2.0 - ESCUCHA REUNIONES Y RESPONDE CON TUS DOCUMENTOS
 ================================================================
 Arquitectura:
   Teams Audio → VB-Cable → faster-whisper → Búsqueda Híbrida (Vector + BM25)
-  → Reranker → Top-5 chunks → LLM Streaming → UI Flotante
-
-Mejoras v2.0:
-  - Búsqueda híbrida (semántica + keywords BM25)
-  - Reranker cross-encoder para precisión
-  - Streaming de respuestas (se ve en tiempo real)
-  - Whisper tiny para velocidad
-  - Timeouts cortos con detección de rate-limit
-  - Detección de preguntas más precisa
+  → RRF Fusion → Top-10 chunks → LLM Streaming → UI Flotante
 
 Uso: python asistente.py
 ================================================================
@@ -27,6 +19,7 @@ import re
 import json
 import math
 import traceback
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from collections import Counter
@@ -646,12 +639,34 @@ class ProcesadorAudio:
 # ════════════════════════════════════════════════════════════
 class InterfazFlotante:
     def __init__(self):
+        # Activar DPI awareness ANTES de crear la ventana
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per-monitor DPI aware
+        except:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except:
+                pass
+        
         self.root = tk.Tk()
         self.root.title("RAG Asistente v2.0")
+        self.root.configure(bg="#0f1219")
+        # Tamaño fijo que NO cubre la barra de tareas (deja 60px abajo)
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_h = screen_h - 80  # Dejar espacio para barra de tareas
+        self.root.geometry(f"960x{win_h}+50+10")
+        self.root.minsize(850, 600)
+        
+        # Siempre encima pero permite interactuar con barra de tareas
         self.root.attributes("-topmost", True)
-        self.root.configure(bg="#0a0e1a")
-        self.root.geometry("900x1000+50+20")
-        self.root.minsize(800, 900)
+        
+        # Al perder foco, bajar prioridad temporalmente para acceder a otras apps
+        self.root.bind("<FocusOut>", self._on_focus_out)
+        self.root.bind("<FocusIn>", self._on_focus_in)
+        
+        # Escalar DPI
+        self.dpi_scale = self.root.winfo_fpixels('1i') / 96.0
         
         # Estado
         self.stream_audio  = None
@@ -662,138 +677,177 @@ class InterfazFlotante:
         self.nivel_audio   = 0.0
         self.pregunta_actual = ""
         
+        # Estilo ttk
+        self._configurar_estilo()
         self._construir_ui()
         self._inicializar_sistema()
     
+    def _configurar_estilo(self):
+        """Configura estilos ttk para un look más profesional."""
+        style = ttk.Style()
+        style.theme_use('clam')
+        
+        # Combobox
+        style.configure('Custom.TCombobox',
+            fieldbackground='#1e2736',
+            background='#2a3a4e',
+            foreground='#e2e8f0',
+            borderwidth=0,
+            relief='flat'
+        )
+        style.map('Custom.TCombobox',
+            fieldbackground=[('readonly', '#1e2736')],
+            foreground=[('readonly', '#e2e8f0')]
+        )
+    
     def _construir_ui(self):
-        """Construye la interfaz flotante."""
-        BG       = "#0a0e1a"
-        BG2      = "#111827"
-        BG3      = "#1a2235"
-        VERDE    = "#00ff88"
+        """Construye la interfaz flotante con diseño profesional."""
+        # Paleta de colores
+        BG       = "#0f1219"   # Fondo principal (más oscuro)
+        BG2      = "#161d2b"   # Paneles
+        BG3      = "#1e2736"   # Inputs/campos
+        ACCENT   = "#10b981"   # Verde esmeralda (más profesional)
         AZUL     = "#3b82f6"
-        AMARILLO = "#fbbf24"
+        AMARILLO = "#f59e0b"
         ROJO     = "#ef4444"
-        TEXTO    = "#e2e8f0"
-        GRIS     = "#64748b"
+        TEXTO    = "#f1f5f9"
+        GRIS     = "#94a3b8"
+        BORDE    = "#2a3a4e"
+        
+        # Fuentes
+        FONT_TITLE  = ("Segoe UI", 13, "bold")
+        FONT_BODY   = ("Segoe UI", 10)
+        FONT_SMALL  = ("Segoe UI", 9)
+        FONT_MONO   = ("Cascadia Code", 10)
+        FONT_LOG    = ("Cascadia Code", 8)
+        FONT_LABEL  = ("Segoe UI", 8, "bold")
         
         # ── Header ───────────────────────────────────────────
-        header = tk.Frame(self.root, bg=BG, pady=8)
-        header.pack(fill="x", padx=12, pady=(10,0))
+        header = tk.Frame(self.root, bg=BG, pady=10)
+        header.pack(fill="x", padx=16, pady=(12,0))
         
-        tk.Label(header, text="⚡ RAG ASISTENTE v2.0", font=("Consolas", 14, "bold"),
-                 bg=BG, fg=VERDE).pack(side="left")
+        tk.Label(header, text="⚡ RAG ASISTENTE", font=FONT_TITLE,
+                 bg=BG, fg=ACCENT).pack(side="left")
         
         self.lbl_proveedor = tk.Label(header, text="iniciando...",
-                                       font=("Consolas", 9), bg=BG, fg=GRIS)
+                                       font=FONT_SMALL, bg=BG, fg=GRIS)
         self.lbl_proveedor.pack(side="right")
         
+        # Separador
+        tk.Frame(self.root, bg=BORDE, height=1).pack(fill="x", padx=16, pady=(8,0))
+        
         # ── Barra de estado ───────────────────────────────────
-        self.lbl_estado = tk.Label(self.root, text="Cargando sistema...",
-                                    font=("Consolas", 10), bg=BG, fg=AMARILLO,
+        self.lbl_estado = tk.Label(self.root, text="⏳ Cargando sistema...",
+                                    font=FONT_BODY, bg=BG, fg=AMARILLO,
                                     anchor="w")
-        self.lbl_estado.pack(fill="x", padx=14, pady=(4,0))
+        self.lbl_estado.pack(fill="x", padx=18, pady=(8,0))
         
         # ── Selector de dispositivo ───────────────────────────
-        frame_dev = tk.Frame(self.root, bg=BG2, padx=8, pady=6)
-        frame_dev.pack(fill="x", padx=12, pady=6)
+        frame_dev = tk.Frame(self.root, bg=BG2, padx=12, pady=10)
+        frame_dev.pack(fill="x", padx=16, pady=(10,0))
         
-        tk.Label(frame_dev, text="🎙️ Entrada:", font=("Consolas", 9),
+        tk.Label(frame_dev, text="🎙️ Entrada de audio:", font=FONT_SMALL,
                  bg=BG2, fg=GRIS).pack(side="left")
         
         self.var_dispositivo = tk.StringVar()
         self.combo_dispositivos = ttk.Combobox(
             frame_dev, textvariable=self.var_dispositivo,
-            font=("Consolas", 9), width=50, state="readonly"
+            font=FONT_SMALL, width=45, state="readonly",
+            style='Custom.TCombobox'
         )
-        self.combo_dispositivos.pack(side="left", padx=6)
+        self.combo_dispositivos.pack(side="left", padx=8)
         
         self.btn_iniciar = tk.Button(
-            frame_dev, text="▶ INICIAR", font=("Consolas", 9, "bold"),
-            bg=VERDE, fg=BG, relief="flat", padx=8,
+            frame_dev, text="▶ INICIAR", font=("Segoe UI", 9, "bold"),
+            bg=ACCENT, fg="#000000", relief="flat", padx=12, pady=4,
+            activebackground="#059669", cursor="hand2",
             command=self.iniciar_escucha
         )
         self.btn_iniciar.pack(side="left", padx=4)
         
         self.btn_detener = tk.Button(
-            frame_dev, text="⏹ PARAR", font=("Consolas", 9, "bold"),
-            bg=ROJO, fg="white", relief="flat", padx=8,
+            frame_dev, text="⏹ PARAR", font=("Segoe UI", 9, "bold"),
+            bg=ROJO, fg="white", relief="flat", padx=12, pady=4,
+            activebackground="#dc2626", cursor="hand2",
             command=self.detener_escucha, state="disabled"
         )
-        self.btn_detener.pack(side="left")
+        self.btn_detener.pack(side="left", padx=2)
         
         # ── Nivel de audio ────────────────────────────────────
-        frame_nivel = tk.Frame(self.root, bg=BG, pady=2)
-        frame_nivel.pack(fill="x", padx=14)
+        frame_nivel = tk.Frame(self.root, bg=BG, pady=4)
+        frame_nivel.pack(fill="x", padx=18)
         
-        tk.Label(frame_nivel, text="Nivel:", font=("Consolas", 8),
+        tk.Label(frame_nivel, text="NIVEL", font=FONT_LABEL,
                  bg=BG, fg=GRIS).pack(side="left")
         
-        self.canvas_nivel = tk.Canvas(frame_nivel, height=8, bg=BG3,
-                                       highlightthickness=0)
-        self.canvas_nivel.pack(side="left", fill="x", expand=True, padx=6)
+        self.canvas_nivel = tk.Canvas(frame_nivel, height=6, bg=BG3,
+                                       highlightthickness=0, bd=0)
+        self.canvas_nivel.pack(side="left", fill="x", expand=True, padx=(8,0))
         
         # ── Última transcripción ──────────────────────────────
-        tk.Label(self.root, text="ÚLTIMO AUDIO DETECTADO",
-                 font=("Consolas", 8, "bold"), bg=BG, fg=GRIS).pack(
-                     anchor="w", padx=14, pady=(8,2))
+        tk.Label(self.root, text="TRANSCRIPCIÓN",
+                 font=FONT_LABEL, bg=BG, fg=GRIS).pack(
+                     anchor="w", padx=18, pady=(10,3))
         
         self.txt_transcripcion = tk.Text(
-            self.root, height=3, font=("Consolas", 10),
-            bg=BG3, fg=TEXTO, relief="flat", padx=8, pady=6,
-            wrap="word", state="disabled", insertbackground=TEXTO
+            self.root, height=2, font=FONT_MONO,
+            bg=BG3, fg=TEXTO, relief="flat", padx=10, pady=8,
+            wrap="word", state="disabled", insertbackground=TEXTO,
+            highlightthickness=1, highlightbackground=BORDE
         )
-        self.txt_transcripcion.pack(fill="x", padx=12, pady=(0,4))
+        self.txt_transcripcion.pack(fill="x", padx=16, pady=(0,4))
         
         # ── Pregunta detectada ────────────────────────────────
-        frame_preg = tk.Frame(self.root, bg=BG2, padx=10, pady=6)
-        frame_preg.pack(fill="x", padx=12, pady=2)
+        frame_preg = tk.Frame(self.root, bg=BG2, padx=12, pady=8)
+        frame_preg.pack(fill="x", padx=16, pady=4)
         
         tk.Label(frame_preg, text="❓ PREGUNTA DETECTADA",
-                 font=("Consolas", 8, "bold"), bg=BG2, fg=AMARILLO).pack(anchor="w")
+                 font=FONT_LABEL, bg=BG2, fg=AMARILLO).pack(anchor="w")
         
         self.lbl_pregunta = tk.Label(
             frame_preg, text="Esperando pregunta...",
-            font=("Consolas", 11), bg=BG2, fg=TEXTO,
-            anchor="w", wraplength=840, justify="left"
+            font=("Segoe UI", 11), bg=BG2, fg=TEXTO,
+            anchor="w", wraplength=880, justify="left"
         )
         self.lbl_pregunta.pack(fill="x", pady=(4,0))
         
         # ── Respuesta ─────────────────────────────────────────
-        tk.Label(self.root, text="💡 RESPUESTA (streaming)",
-                 font=("Consolas", 8, "bold"), bg=BG, fg=VERDE).pack(
-                     anchor="w", padx=14, pady=(10,2))
+        tk.Label(self.root, text="💡 RESPUESTA",
+                 font=FONT_LABEL, bg=BG, fg=ACCENT).pack(
+                     anchor="w", padx=18, pady=(10,3))
         
         self.txt_respuesta = scrolledtext.ScrolledText(
-            self.root, height=20, font=("Consolas", 11),
-            bg=BG2, fg=VERDE, relief="flat", padx=10, pady=8,
+            self.root, height=18, font=FONT_MONO,
+            bg=BG2, fg=ACCENT, relief="flat", padx=12, pady=10,
             wrap="word", state="disabled",
-            selectbackground=AZUL
+            selectbackground=AZUL, selectforeground="white",
+            highlightthickness=1, highlightbackground=BORDE
         )
-        self.txt_respuesta.pack(fill="both", expand=True, padx=12, pady=(0,4))
+        self.txt_respuesta.pack(fill="both", expand=True, padx=16, pady=(0,4))
         
         # ── Fuentes ───────────────────────────────────────────
         self.lbl_fuentes = tk.Label(
             self.root, text="Fuentes: —",
-            font=("Consolas", 8), bg=BG, fg=GRIS, anchor="w"
+            font=FONT_SMALL, bg=BG, fg=GRIS, anchor="w"
         )
-        self.lbl_fuentes.pack(fill="x", padx=14, pady=(0,2))
+        self.lbl_fuentes.pack(fill="x", padx=18, pady=(0,4))
         
         # ── Log ───────────────────────────────────────────────
         self.txt_log = tk.Text(
-            self.root, height=5, font=("Consolas", 8),
-            bg=BG3, fg=GRIS, relief="flat", padx=8, pady=4,
-            wrap="word", state="disabled"
+            self.root, height=4, font=FONT_LOG,
+            bg=BG3, fg=GRIS, relief="flat", padx=10, pady=6,
+            wrap="word", state="disabled",
+            highlightthickness=1, highlightbackground=BORDE
         )
-        self.txt_log.pack(fill="x", padx=12, pady=(0,10))
+        self.txt_log.pack(fill="x", padx=16, pady=(0,8))
         
         # Copiar respuesta con doble clic
         self.txt_respuesta.bind("<Double-Button-1>", self.copiar_respuesta)
         self.root.bind("<Escape>", lambda e: self.root.iconify())
         
-        # Tip
-        tk.Label(self.root, text="💡 Doble clic en respuesta para copiar | ESC minimizar",
-                 font=("Consolas", 7), bg=BG, fg=GRIS).pack(pady=(0,6))
+        # Footer
+        tk.Label(self.root, text="Doble clic en respuesta para copiar  •  ESC minimizar",
+                 font=("Segoe UI", 8), bg=BG, fg="#475569").pack(pady=(0,8))
     
     def _set_texto(self, widget: tk.Text, texto: str, color=None):
         widget.config(state="normal")
@@ -802,6 +856,14 @@ class InterfazFlotante:
             widget.config(fg=color)
         widget.insert("end", texto)
         widget.config(state="disabled")
+    
+    def _on_focus_out(self, event=None):
+        """Al perder foco, dejar de estar encima para acceder a otras apps."""
+        self.root.attributes("-topmost", False)
+    
+    def _on_focus_in(self, event=None):
+        """Al recuperar foco, volver a estar encima."""
+        self.root.attributes("-topmost", True)
     
     def copiar_respuesta(self, event=None):
         try:
