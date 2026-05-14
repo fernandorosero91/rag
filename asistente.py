@@ -587,11 +587,132 @@ class ProcesadorAudio:
             cola_ui.put(("log", f"📝 {texto[:80]}..."))
             
             if self.detectar_pregunta(texto):
-                cola_ui.put(("pregunta_detectada", texto))
-                self.procesar_pregunta(texto)
+                # Extraer solo la pregunta, descartando conversación casual
+                pregunta_limpia = self.extraer_pregunta(texto)
+                if pregunta_limpia and len(pregunta_limpia) > 15:
+                    cola_ui.put(("pregunta_detectada", pregunta_limpia))
+                    self.procesar_pregunta(pregunta_limpia)
             
         except Exception as e:
             cola_ui.put(("log", f"Error transcripción: {e}"))
+    
+    def extraer_pregunta(self, texto: str) -> str:
+        """Extrae la pregunta real de un bloque de texto que puede tener conversación casual."""
+        
+        # Limpiar muletillas comunes al inicio
+        muletillas = [
+            "a ver entonces la pregunta sería",
+            "a ver entonces la pregunta es",
+            "entonces la pregunta sería",
+            "entonces la pregunta es",
+            "la pregunta sería",
+            "la pregunta es",
+            "a ver entonces",
+            "bueno entonces",
+            "ok entonces",
+            "okay entonces",
+            "vale entonces",
+            "bueno la pregunta es",
+            "a ver",
+            "bueno",
+            "entonces",
+            "pues",
+            "ok",
+            "okay",
+            "vale",
+            "mira",
+            "oye",
+            "eh",
+            "ah",
+        ]
+        
+        texto_limpio = texto.strip()
+        texto_lower = texto_limpio.lower()
+        
+        # Remover muletillas del inicio (de más larga a más corta)
+        for muletilla in muletillas:
+            if texto_lower.startswith(muletilla):
+                texto_limpio = texto_limpio[len(muletilla):].strip()
+                # Remover comas o puntos después de la muletilla
+                if texto_limpio and texto_limpio[0] in ",.:;":
+                    texto_limpio = texto_limpio[1:].strip()
+                texto_lower = texto_limpio.lower()
+                break
+        
+        # Si tiene signo de pregunta, extraer desde la palabra interrogativa hasta el ?
+        if "?" in texto_limpio:
+            # Buscar el último bloque con ?
+            partes = texto_limpio.split("?")
+            # Tomar la última pregunta completa (la parte antes del último ?)
+            for i in range(len(partes) - 1, -1, -1):
+                parte = partes[i].strip()
+                if len(parte) > 15:
+                    # Buscar dónde empieza la pregunta (palabra interrogativa o comando)
+                    pregunta = self._encontrar_inicio_pregunta(parte)
+                    if pregunta:
+                        return pregunta + "?"
+            return texto_limpio
+        
+        # Sin signo de pregunta — buscar dónde empieza la instrucción/pregunta
+        pregunta = self._encontrar_inicio_pregunta(texto_limpio)
+        return pregunta if pregunta else texto_limpio
+    
+    def _encontrar_inicio_pregunta(self, texto: str) -> str:
+        """Encuentra dónde empieza la pregunta real dentro de un texto con charla."""
+        texto_lower = texto.lower()
+        
+        # Marcadores que indican inicio de pregunta
+        marcadores_interrogativos = [
+            "cómo", "como", "qué", "que", "cuál", "cual", "cuáles", "cuales",
+            "cuándo", "cuando", "dónde", "donde", "por qué", "quién", "quien",
+            "cuánto", "cuanto"
+        ]
+        
+        marcadores_comando = [
+            "explica", "explique", "expliquen",
+            "describe", "describa", "menciona", "mencione",
+            "define", "defina", "dime", "dígame",
+            "identifica", "identifique", "analiza", "analice",
+            "evalúa", "evalúe", "compara", "compare",
+            "relaciona", "relacione", "desarrolla", "desarrolle",
+            "señala", "señale", "indica", "indique",
+            "detalla", "detalle", "resuma", "resume",
+            "plantea", "plantee", "justifica", "justifique",
+            "argumente", "argumenta"
+        ]
+        
+        marcadores_frase = [
+            "en el esquema", "dentro de la", "dentro del",
+            "de acuerdo con", "según la", "según el",
+            "con base en", "a partir de", "teniendo en cuenta",
+            "de forma aplicada", "en relación con"
+        ]
+        
+        # Buscar la posición más temprana de un marcador de pregunta
+        mejor_pos = len(texto)
+        
+        # Buscar frases primero (más específicas)
+        for frase in marcadores_frase:
+            pos = texto_lower.find(frase)
+            if pos != -1 and pos < mejor_pos:
+                mejor_pos = pos
+        
+        # Buscar palabras interrogativas y comandos
+        palabras = texto_lower.split()
+        posicion_char = 0
+        for i, palabra in enumerate(palabras):
+            if palabra in marcadores_interrogativos or palabra in marcadores_comando:
+                # Calcular posición en caracteres
+                pos = texto_lower.find(palabra, posicion_char)
+                if pos != -1 and pos < mejor_pos:
+                    mejor_pos = pos
+                break  # Tomar la primera ocurrencia relevante después de buscar frases
+            posicion_char += len(palabra) + 1
+        
+        if mejor_pos < len(texto):
+            return texto[mejor_pos:].strip()
+        
+        return texto
     
     def procesar_pregunta(self, pregunta: str):
         """Busca en RAG y llama al LLM con streaming."""
