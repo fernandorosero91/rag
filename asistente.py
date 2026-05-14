@@ -82,13 +82,13 @@ DB_PATH             = "./db"
 BM25_PATH           = "./db/bm25_index.json"
 EMBED_MODEL         = "BAAI/bge-m3"
 
-# Audio config — optimizado para velocidad
+# Audio config — balanceado para capturar preguntas completas
 SAMPLE_RATE     = 16000
-BLOCK_SECONDS   = 0.3           # Bloques más cortos para reacción rápida
-SILENCE_UMBRAL  = 0.012         # Ligeramente más sensible
-MIN_SPEECH_SEC  = 1.2           # Mínimo más corto para procesar
-MAX_BUFFER_SEC  = 10
-SILENCE_BLOCKS  = 4             # 4 × 0.3s = 1.2s de silencio para cortar
+BLOCK_SECONDS   = 0.3           # Bloques de 300ms
+SILENCE_UMBRAL  = 0.008         # Más sensible para no perder audio suave
+MIN_SPEECH_SEC  = 1.5           # Mínimo para procesar
+MAX_BUFFER_SEC  = 25            # Permite preguntas largas (~25 seg)
+SILENCE_BLOCKS  = 10            # 10 × 0.3s = 3.0s de silencio para cortar
 
 # Palabras clave para detectar preguntas — solo las más confiables
 PALABRAS_PREGUNTA_INICIO = [
@@ -482,7 +482,7 @@ class ProcesadorAudio:
             return False
     
     def detectar_pregunta(self, texto: str) -> bool:
-        """Detecta preguntas con menos falsos positivos."""
+        """Detecta preguntas de forma tolerante (Whisper puede perder la primera palabra)."""
         texto_lower = texto.lower().strip()
         
         # Signos de pregunta explícitos
@@ -493,20 +493,50 @@ class ProcesadorAudio:
         if not palabras:
             return False
         
-        # Primera palabra es interrogativa
-        if palabras[0] in PALABRAS_PREGUNTA_INICIO:
+        # Palabras interrogativas — buscar en las primeras 5 palabras
+        # (Whisper a veces corta "cuál" y queda "es el límite...")
+        interrogativas = [
+            "qué", "que", "cómo", "como", "cuál", "cual", "cuáles", "cuales",
+            "cuándo", "cuando", "dónde", "donde", "por qué", "quién", "quien",
+            "cuánto", "cuanto", "cuántos", "cuántas"
+        ]
+        
+        # Comandos directos — buscar en las primeras 3 palabras
+        comandos = [
+            "explica", "explique", "describe", "menciona", "define",
+            "dime", "dame", "muéstrame", "cuéntame", "enumera", "lista",
+            "háblame", "hablame", "habla", "háblanos", "hablanos"
+        ]
+        
+        # Buscar interrogativas en las primeras 5 palabras
+        primeras_5 = palabras[:5]
+        for palabra in primeras_5:
+            if palabra in interrogativas:
+                return True
+        
+        # Buscar comandos en las primeras 3 palabras
+        primeras_3 = palabras[:3]
+        for palabra in primeras_3:
+            if palabra in comandos:
+                return True
+        
+        # Frases parciales (por si Whisper corta el inicio)
+        texto_inicio = " ".join(palabras[:6])
+        if "por qu" in texto_inicio or "para qu" in texto_inicio:
             return True
         
-        # Primeras 2 palabras contienen interrogativa
-        if len(palabras) >= 2:
-            dos_primeras = " ".join(palabras[:2])
-            for p in PALABRAS_PREGUNTA_INICIO[:18]:  # solo interrogativas puras
-                if p in dos_primeras:
+        # Patrones comunes que indican pregunta aunque falte la primera palabra
+        # ej: "es el límite máximo..." (faltó "cuál")
+        patrones_pregunta = [
+            "es el", "son los", "son las", "es la",
+            "se basa", "se define", "se establece", "se menciona",
+            "significa", "implica", "establece"
+        ]
+        if len(palabras) >= 4:
+            inicio = " ".join(palabras[:3])
+            for patron in patrones_pregunta:
+                if inicio.startswith(patron):
                     return True
-        
-        # Frases que empiezan con "por qué" o "para qué"
-        if texto_lower.startswith("por qu") or texto_lower.startswith("para qu"):
-            return True
         
         return False
     

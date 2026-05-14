@@ -49,7 +49,7 @@ print("🎙️ Cargando Whisper...")
 whisper_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
 print("🧠 Cargando embeddings...")
-embed_model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+embed_model = SentenceTransformer("BAAI/bge-m3")
 
 print("🗄️ Cargando base de datos...")
 try:
@@ -158,32 +158,55 @@ CONTEXTO:
     return "No se pudo obtener respuesta"
 
 def detectar_pregunta(texto: str) -> bool:
-    palabras_clave = [
-        "qué", "que", "cómo", "como", "cuál", "cual", "cuáles", "cuales",
-        "cuándo", "cuando", "dónde", "donde", "por qué", "porque", "quién",
-        "quien", "explica", "explique", "describe", "menciona", "define",
-        "dime", "dame", "muestra", "muéstrame", "enumera", "lista", "detalla"
-    ]
+    """Detecta preguntas de forma tolerante (Whisper puede perder la primera palabra)."""
+    texto_lower = texto.lower().strip()
     
     if "?" in texto:
         return True
     
-    texto_lower = texto.lower()
     palabras = texto_lower.split()
+    if not palabras:
+        return False
     
-    if palabras and palabras[0] in palabras_clave:
+    interrogativas = [
+        "qué", "que", "cómo", "como", "cuál", "cual", "cuáles", "cuales",
+        "cuándo", "cuando", "dónde", "donde", "por qué", "quién", "quien",
+        "cuánto", "cuanto", "cuántos", "cuántas"
+    ]
+    
+    comandos = [
+        "explica", "explique", "describe", "menciona", "define",
+        "dime", "dame", "muéstrame", "cuéntame", "enumera", "lista",
+        "háblame", "hablame", "habla", "háblanos", "hablanos", "detalla"
+    ]
+    
+    # Buscar interrogativas en las primeras 5 palabras
+    primeras_5 = palabras[:5]
+    for palabra in primeras_5:
+        if palabra in interrogativas:
+            return True
+    
+    # Buscar comandos en las primeras 3 palabras
+    primeras_3 = palabras[:3]
+    for palabra in primeras_3:
+        if palabra in comandos:
+            return True
+    
+    # Frases parciales
+    texto_inicio = " ".join(palabras[:6])
+    if "por qu" in texto_inicio or "para qu" in texto_inicio:
         return True
     
-    # Buscar en las primeras 3 palabras
-    if len(palabras) >= 2:
-        primeras = " ".join(palabras[:3])
-        for palabra in palabras_clave:
-            if palabra in primeras:
-                return True
-    
-    if len(palabras) > 4:
-        for palabra in palabras_clave[:15]:
-            if palabra in texto_lower:
+    # Patrones que indican pregunta aunque falte la primera palabra
+    patrones_pregunta = [
+        "es el", "son los", "son las", "es la",
+        "se basa", "se define", "se establece", "se menciona",
+        "significa", "implica", "establece"
+    ]
+    if len(palabras) >= 4:
+        inicio = " ".join(palabras[:3])
+        for patron in patrones_pregunta:
+            if inicio.startswith(patron):
                 return True
     
     return False

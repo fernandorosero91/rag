@@ -37,7 +37,7 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 CEREBRAS_MODEL = os.getenv("CEREBRAS_MODEL", "llama3.3-70b")
 RAG_TOP_K = int(os.getenv("RAG_TOP_K", 8))  # Aumentado para más contexto
 DB_PATH = "./db"
-EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBED_MODEL = "BAAI/bge-m3"
 
 # ── Cargar RAG ────────────────────────────────────────────────
 print("🧠 Cargando modelo de embeddings...")
