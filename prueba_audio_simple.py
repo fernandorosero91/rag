@@ -158,7 +158,7 @@ CONTEXTO:
     return "No se pudo obtener respuesta"
 
 def detectar_pregunta(texto: str) -> bool:
-    """Detecta preguntas de forma tolerante (Whisper puede perder la primera palabra)."""
+    """Detecta preguntas de forma amplia — casi todo lo que suene a pregunta o instrucción académica."""
     texto_lower = texto.lower().strip()
     
     if "?" in texto:
@@ -168,46 +168,77 @@ def detectar_pregunta(texto: str) -> bool:
     if not palabras:
         return False
     
+    if len(palabras) < 4:
+        return False
+    
+    # Interrogativas — buscar en CUALQUIER parte del texto
     interrogativas = [
         "qué", "que", "cómo", "como", "cuál", "cual", "cuáles", "cuales",
         "cuándo", "cuando", "dónde", "donde", "por qué", "quién", "quien",
         "cuánto", "cuanto", "cuántos", "cuántas"
     ]
     
-    comandos = [
-        "explica", "explique", "describe", "menciona", "define",
-        "dime", "dame", "muéstrame", "cuéntame", "enumera", "lista",
-        "háblame", "hablame", "habla", "háblanos", "hablanos", "detalla"
-    ]
-    
-    # Buscar interrogativas en las primeras 5 palabras
-    primeras_5 = palabras[:5]
-    for palabra in primeras_5:
+    for palabra in palabras:
         if palabra in interrogativas:
             return True
     
-    # Buscar comandos en las primeras 3 palabras
-    primeras_3 = palabras[:3]
-    for palabra in primeras_3:
+    # Comandos/verbos de instrucción — primeras 6 palabras
+    comandos = [
+        "explica", "explique", "expliquen", "explicar",
+        "describe", "describa", "describir",
+        "menciona", "mencione", "mencionar",
+        "define", "defina", "definir",
+        "dime", "dígame", "dame", "muéstrame", "muestre",
+        "cuéntame", "cuénteme", "enumera", "enumere",
+        "lista", "liste", "listar",
+        "háblame", "hablame", "habla", "háblanos", "hablanos",
+        "identifica", "identifique", "identificar",
+        "analiza", "analice", "analizar",
+        "evalúa", "evalúe", "evaluar", "evaluaría",
+        "compara", "compare", "comparar",
+        "relaciona", "relacione", "relacionar",
+        "justifica", "justifique", "justificar",
+        "argumente", "argumenta", "argumentar",
+        "desarrolla", "desarrolle", "desarrollar",
+        "señala", "señale", "señalar",
+        "indica", "indique", "indicar",
+        "detalla", "detalle", "detallar",
+        "resuma", "resume", "resumir",
+        "plantea", "plantee", "plantear"
+    ]
+    
+    primeras_6 = palabras[:6]
+    for palabra in primeras_6:
         if palabra in comandos:
             return True
     
-    # Frases parciales
-    texto_inicio = " ".join(palabras[:6])
-    if "por qu" in texto_inicio or "para qu" in texto_inicio:
-        return True
+    # Frases académicas comunes
+    frases_academicas = [
+        "en el esquema", "dentro de la", "dentro del",
+        "de acuerdo con", "de acuerdo al", "según la", "según el",
+        "con base en", "con relación a", "en relación con",
+        "a partir de", "teniendo en cuenta", "de forma aplicada",
+        "de qué manera", "en qué consiste", "en qué se basa",
+        "cuál es la diferencia", "cuál es el papel",
+        "cómo se ve", "cómo se relaciona", "cómo se identifica",
+        "cómo evaluaría", "cómo aplicaría", "cómo se aplica"
+    ]
     
-    # Patrones que indican pregunta aunque falte la primera palabra
+    for frase in frases_academicas:
+        if frase in texto_lower:
+            return True
+    
+    # Patrones de pregunta incompleta (Whisper cortó el inicio)
     patrones_pregunta = [
         "es el", "son los", "son las", "es la",
         "se basa", "se define", "se establece", "se menciona",
+        "se ve identificado", "se relaciona", "se aplica",
         "significa", "implica", "establece"
     ]
-    if len(palabras) >= 4:
-        inicio = " ".join(palabras[:3])
-        for patron in patrones_pregunta:
-            if inicio.startswith(patron):
-                return True
+    inicio = " ".join(palabras[:3])
+    for patron in patrones_pregunta:
+        if inicio.startswith(patron):
+            return True
     
     return False
 
